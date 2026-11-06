@@ -1,0 +1,8 @@
+{
+  "name": "vedhika-backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "python manage.py runserver 127.0.0.1:8000"
+  }
+}
