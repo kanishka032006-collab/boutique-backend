@@ -232,6 +232,38 @@ class Payment(models.Model):
         return f"Payment for order #{self.order_id} · {self.status}"
 
 
+class RazorpayCheckout(models.Model):
+    class Status(models.TextChoices):
+        CREATED = "created", "Created"
+        PAID = "paid", "Paid"
+        FAILED = "failed", "Failed"
+        CANCELLED = "cancelled", "Cancelled"
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="razorpay_checkouts")
+    order = models.OneToOneField(Order, on_delete=models.SET_NULL, null=True, blank=True, related_name="razorpay_checkout")
+    razorpay_order_id = models.CharField(max_length=100, unique=True)
+    razorpay_payment_id = models.CharField(max_length=100, blank=True)
+    razorpay_signature = models.CharField(max_length=255, blank=True)
+    subtotal = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
+    delivery_charge = models.DecimalField(max_digits=10, decimal_places=2, default=0, validators=[MinValueValidator(0)])
+    delivery_distance_km = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
+    currency = models.CharField(max_length=10, default="INR")
+    shipping_address = models.JSONField()
+    notes = models.TextField(blank=True)
+    items_snapshot = models.JSONField(default=list)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.CREATED)
+    failure_reason = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Razorpay {self.razorpay_order_id} ({self.status})"
+
+
 class Quotation(models.Model):
     class EventType(models.TextChoices):
         WEDDING = "wedding", "Wedding"

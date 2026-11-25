@@ -1,7 +1,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
-from .models import Cart, CartItem, Category, ContactMessage, CustomerProfile, Order, OrderItem, Payment, Product, ProductImage, Quotation, User, Wishlist
+from .models import Cart, CartItem, Category, ContactMessage, CustomerProfile, Order, OrderItem, Payment, Product, ProductImage, Quotation, RazorpayCheckout, User, Wishlist
 
 
 @admin.register(User)
@@ -58,6 +58,13 @@ class ContactMessageAdmin(admin.ModelAdmin):
     list_display = ("name", "email", "is_read", "created_at")
     list_filter = ("is_read", "created_at")
     search_fields = ("name", "email", "message")
+
+
+@admin.register(RazorpayCheckout)
+class RazorpayCheckoutAdmin(admin.ModelAdmin):
+    list_display = ("razorpay_order_id", "user", "amount", "status", "order", "created_at")
+    list_filter = ("status", "created_at")
+    search_fields = ("razorpay_order_id", "razorpay_payment_id", "user__email")
 
 
 admin.site.register(CustomerProfile)

@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -46,6 +49,7 @@ from .models import (
     Product,
     ProductImage,
     Quotation,
+    RazorpayCheckout,
     User,
     Wishlist,
 )
@@ -60,6 +64,9 @@ from .serializers import (
     ProductImageSerializer,
     ProductSerializer,
     QuotationSerializer,
+    RazorpayFailSerializer,
+    RazorpayOrderCreateSerializer,
+    RazorpayVerifySerializer,
     ShippingAddressSerializer,
     UserSummarySerializer,
     WishlistSerializer,
@@ -74,6 +81,70 @@ class DeliveryDistanceError(Exception):
 
 class DeliveryLocationNotFound(DeliveryDistanceError):
     pass
+
+
+class RazorpayError(Exception):
+    pass
+
+
+def _razorpay_configured():
+    return bool(settings.RAZORPAY_KEY_ID and settings.RAZORPAY_KEY_SECRET)
+
+
+def _razorpay_create_remote_order(amount_paise, receipt, notes=None):
+    credentials = f"{settings.RAZORPAY_KEY_ID}:{settings.RAZORPAY_KEY_SECRET}".encode("utf-8")
+    auth_header = base64.b64encode(credentials).decode("ascii")
+    payload = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "receipt": receipt[:40],
+        "notes": notes or {},
+    }
+    request = Request(
+        "https://api.razorpay.com/v1/orders",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Basic {auth_header}",
+            "Content-Type": "application/json",
+            "User-Agent": "VedhikaBoutique/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = ""
+        try:
+            body = json.loads(error.read().decode("utf-8"))
+            detail = body.get("error", {}).get("description", "")
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            detail = ""
+        logger.warning("Razorpay order creation failed (%s): %s", error.code, detail)
+        raise RazorpayError(detail or "Could not initiate payment with Razorpay. Please try again.") from error
+    except (URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RazorpayError("Razorpay is temporarily unavailable. Please try again.") from error
+    if not result.get("id"):
+        raise RazorpayError("Razorpay returned an incomplete order response.")
+    return result
+
+
+def _verify_razorpay_signature(order_id, payment_id, signature):
+    expected = hmac.new(
+        settings.RAZORPAY_KEY_SECRET.encode("utf-8"),
+        f"{order_id}|{payment_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _verify_razorpay_webhook_signature(body_bytes, signature):
+    expected = hmac.new(
+        settings.RAZORPAY_WEBHOOK_SECRET.encode("utf-8"),
+        body_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
 
 
 _nominatim_lock = threading.Lock()
@@ -611,6 +682,172 @@ def wishlist(request, product_id=None):
     return Response({"items": WishlistSerializer(saved, many=True, context={"request": request}).data})
 
 
+def _prepare_cart_checkout(user, customizations):
+    Cart.objects.get_or_create(user=user)
+    cart_object = Cart.objects.select_for_update().get(user=user)
+    items = list(
+        CartItem.objects.select_for_update()
+        .filter(cart=cart_object)
+        .select_related("product")
+        .order_by("id")
+    )
+    if not items:
+        return None, None, Decimal("0.00"), Response({"error": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
+    if any(not item.product.is_active for item in items):
+        return None, None, Decimal("0.00"), Response(
+            {"error": "A product in your cart is no longer available. Remove it before checkout."},
+            status=status.HTTP_409_CONFLICT,
+        )
+    cart_product_ids = {item.product_id for item in items}
+    if any(product_id not in cart_product_ids for product_id in customizations):
+        return None, None, Decimal("0.00"), Response(
+            {"error": "Customization was submitted for a product not in your cart."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    subtotal = Decimal("0.00")
+    prepared_items = []
+    for item in items:
+        product = Product.objects.select_for_update().get(pk=item.product_id)
+        if item.quantity > product.stock:
+            return None, None, Decimal("0.00"), Response(
+                {"error": f"{product.name} no longer has enough stock."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        customization = customizations.get(item.product_id) or {}
+        if (customization.get("giftMessage") or customization.get("printedName")) and not product.is_customizable:
+            return None, None, Decimal("0.00"), Response(
+                {"error": f"{product.name} does not support customization."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        unit_price = product.discounted_price
+        subtotal += unit_price * item.quantity
+        prepared_items.append(
+            {
+                "product_id": product.id,
+                "product_name": product.name,
+                "unit_price": str(unit_price),
+                "quantity": item.quantity,
+                "gift_message": customization.get("giftMessage", ""),
+                "printed_name": customization.get("printedName", ""),
+            }
+        )
+    return cart_object, prepared_items, subtotal, None
+
+
+def _create_order_from_prepared_items(
+    *,
+    user,
+    subtotal,
+    delivery_charge,
+    delivery_distance_km,
+    shipping_address,
+    notes,
+    prepared_items,
+    payment_method,
+    payment_status,
+    order_status,
+    provider_reference="",
+    cart_object=None,
+):
+    product_ids = [item["product_id"] for item in prepared_items]
+    locked_products = {
+        product.pk: product
+        for product in Product.objects.select_for_update().filter(pk__in=product_ids)
+    }
+    for item in prepared_items:
+        product = locked_products.get(item["product_id"])
+        if not product or not product.is_active:
+            return None, Response(
+                {"error": f"{item['product_name']} is no longer available."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if item["quantity"] > product.stock:
+            return None, Response(
+                {"error": f"{product.name} no longer has enough stock."},
+                status=status.HTTP_409_CONFLICT,
+            )
+    order = Order.objects.create(
+        user=user,
+        status=order_status,
+        subtotal=subtotal,
+        delivery_charge=delivery_charge,
+        delivery_distance_km=delivery_distance_km,
+        shipping_address=shipping_address,
+        notes=notes,
+        payment_method=payment_method,
+        payment_status=payment_status,
+    )
+    Payment.objects.create(
+        order=order,
+        method=payment_method,
+        status=payment_status,
+        amount=order.total,
+        provider_reference=provider_reference,
+    )
+    for item in prepared_items:
+        product = locked_products[item["product_id"]]
+        OrderItem.objects.create(
+            order=order,
+            product=product,
+            product_name=item["product_name"],
+            unit_price=Decimal(item["unit_price"]),
+            quantity=item["quantity"],
+            gift_message=item.get("gift_message", ""),
+            printed_name=item.get("printed_name", ""),
+        )
+        product.stock -= item["quantity"]
+        product.save(update_fields=["stock", "updated_at"])
+    if cart_object is not None:
+        cart_object.items.all().delete()
+    else:
+        CartItem.objects.filter(cart__user=user).delete()
+    order.refresh_from_db()
+    return order, None
+
+
+def _finalize_razorpay_checkout(checkout, payment_id, signature=""):
+    if checkout.order_id:
+        return checkout.order, False, None
+    order, error_response = _create_order_from_prepared_items(
+        user=checkout.user,
+        subtotal=checkout.subtotal,
+        delivery_charge=checkout.delivery_charge,
+        delivery_distance_km=checkout.delivery_distance_km,
+        shipping_address=checkout.shipping_address,
+        notes=checkout.notes,
+        prepared_items=checkout.items_snapshot,
+        payment_method="razorpay",
+        payment_status=Order.PaymentStatus.PAID,
+        order_status=Order.Status.CONFIRMED,
+        provider_reference=payment_id,
+    )
+    if error_response is not None:
+        checkout.razorpay_payment_id = payment_id
+        checkout.razorpay_signature = signature
+        checkout.status = RazorpayCheckout.Status.FAILED
+        checkout.failure_reason = str(error_response.data.get("error", ""))[:300]
+        checkout.save(update_fields=["razorpay_payment_id", "razorpay_signature", "status", "failure_reason", "updated_at"])
+        return None, False, error_response
+    checkout.order = order
+    checkout.razorpay_payment_id = payment_id
+    checkout.razorpay_signature = signature
+    checkout.status = RazorpayCheckout.Status.PAID
+    checkout.failure_reason = ""
+    checkout.save(update_fields=["order", "razorpay_payment_id", "razorpay_signature", "status", "failure_reason", "updated_at"])
+    return order, True, None
+
+
+def _mark_cancelled_payment(order):
+    if order.payment_status == Order.PaymentStatus.PAID:
+        order.payment_status = Order.PaymentStatus.REFUNDED
+        order.save(update_fields=["status", "payment_status", "updated_at"])
+        Payment.objects.filter(order=order, status=Payment.Status.PAID).update(status=Payment.Status.REFUNDED)
+    else:
+        order.payment_status = Order.PaymentStatus.FAILED
+        order.save(update_fields=["status", "payment_status", "updated_at"])
+        Payment.objects.filter(order=order, status=Payment.Status.PENDING).update(status=Payment.Status.FAILED)
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_order(request):
@@ -623,60 +860,194 @@ def create_order(request):
     except DeliveryDistanceError as error:
         return Response({"error": str(error)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
     customizations = {item["productId"]: item for item in serializer.validated_data.get("customizations", [])}
-    try:
-        with transaction.atomic():
-            Cart.objects.get_or_create(user=request.user)
-            cart_object = Cart.objects.select_for_update().get(user=request.user)
-            items = list(
-                CartItem.objects.select_for_update()
-                .filter(cart=cart_object)
-                .select_related("product")
-                .order_by("id")
-            )
-            if not items:
-                return Response({"error": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
-            if any(not item.product.is_active for item in items):
-                return Response({"error": "A product in your cart is no longer available. Remove it before checkout."}, status=status.HTTP_409_CONFLICT)
-            cart_product_ids = {item.product_id for item in items}
-            if any(product_id not in cart_product_ids for product_id in customizations):
-                return Response({"error": "Customization was submitted for a product not in your cart."}, status=status.HTTP_400_BAD_REQUEST)
-            subtotal = Decimal("0.00")
-            for item in items:
-                product = Product.objects.select_for_update().get(pk=item.product_id)
-                if item.quantity > product.stock:
-                    return Response({"error": f"{product.name} no longer has enough stock."}, status=status.HTTP_409_CONFLICT)
-                customization = customizations.get(item.product_id)
-                if customization and (customization["giftMessage"] or customization["printedName"]) and not product.is_customizable:
-                    return Response({"error": f"{product.name} does not support customization."}, status=status.HTTP_400_BAD_REQUEST)
-                subtotal += product.discounted_price * item.quantity
-            order = Order.objects.create(
-                user=request.user,
-                subtotal=subtotal,
-                delivery_charge=delivery_quote["cod_charge"],
-                delivery_distance_km=delivery_quote["distance_km"],
-                shipping_address=serializer.validated_data["shippingAddress"],
-                notes=serializer.validated_data.get("notes", ""),
-            )
-            Payment.objects.create(order=order, amount=order.total)
-            for item in items:
-                product = Product.objects.select_for_update().get(pk=item.product_id)
-                customization = customizations.get(item.product_id, {})
-                OrderItem.objects.create(
-                    order=order,
-                    product=product,
-                    product_name=product.name,
-                    unit_price=product.discounted_price,
-                    quantity=item.quantity,
-                    gift_message=customization.get("giftMessage", ""),
-                    printed_name=customization.get("printedName", ""),
-                )
-                product.stock -= item.quantity
-                product.save(update_fields=["stock", "updated_at"])
-            cart_object.items.all().delete()
-    except Cart.DoesNotExist:
-        return Response({"error": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
-    order.refresh_from_db()
+    with transaction.atomic():
+        cart_object, prepared_items, subtotal, error_response = _prepare_cart_checkout(request.user, customizations)
+        if error_response is not None:
+            return error_response
+        order, error_response = _create_order_from_prepared_items(
+            user=request.user,
+            subtotal=subtotal,
+            delivery_charge=delivery_quote["cod_charge"],
+            delivery_distance_km=delivery_quote["distance_km"],
+            shipping_address=serializer.validated_data["shippingAddress"],
+            notes=serializer.validated_data.get("notes", ""),
+            prepared_items=prepared_items,
+            payment_method="cash_on_delivery",
+            payment_status=Order.PaymentStatus.PENDING,
+            order_status=Order.Status.PENDING,
+            cart_object=cart_object,
+        )
+        if error_response is not None:
+            return error_response
     return Response({"order": OrderSerializer(order).data}, status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def payment_config(request):
+    enabled = _razorpay_configured()
+    return Response(
+        {
+            "razorpay_enabled": enabled,
+            "razorpay_key_id": settings.RAZORPAY_KEY_ID if enabled else "",
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def razorpay_create_order(request):
+    if not _razorpay_configured():
+        return Response({"error": "Online payments are not configured yet."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    serializer = RazorpayOrderCreateSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    if not CartItem.objects.filter(cart__user=request.user).exists():
+        return Response({"error": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        delivery_quote = _delivery_quote(serializer.validated_data["shippingAddress"])
+    except DeliveryDistanceError as error:
+        return Response({"error": str(error)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    customizations = {item["productId"]: item for item in serializer.validated_data.get("customizations", [])}
+    with transaction.atomic():
+        _, prepared_items, subtotal, error_response = _prepare_cart_checkout(request.user, customizations)
+        if error_response is not None:
+            return error_response
+    total = (subtotal + delivery_quote["cod_charge"]).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    amount_paise = int((total * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    if amount_paise < 100:
+        return Response({"error": "Minimum online payment amount is ₹1.00."}, status=status.HTTP_400_BAD_REQUEST)
+    receipt = f"vedhika_{request.user.id}_{int(time.time() * 1000)}"
+    try:
+        remote_order = _razorpay_create_remote_order(
+            amount_paise=amount_paise,
+            receipt=receipt,
+            notes={"customer_email": request.user.email, "customer_name": request.user.name},
+        )
+    except RazorpayError as error:
+        return Response({"error": str(error)}, status=status.HTTP_502_BAD_GATEWAY)
+    shipping_address = serializer.validated_data["shippingAddress"]
+    RazorpayCheckout.objects.create(
+        user=request.user,
+        razorpay_order_id=remote_order["id"],
+        subtotal=subtotal,
+        delivery_charge=delivery_quote["cod_charge"],
+        delivery_distance_km=delivery_quote["distance_km"],
+        amount=total,
+        currency=remote_order.get("currency", "INR"),
+        shipping_address=shipping_address,
+        notes=serializer.validated_data.get("notes", ""),
+        items_snapshot=prepared_items,
+    )
+    return Response(
+        {
+            "key": settings.RAZORPAY_KEY_ID,
+            "orderId": remote_order["id"],
+            "amount": amount_paise,
+            "amountInr": str(total),
+            "currency": remote_order.get("currency", "INR"),
+            "name": "VEDHIKA BRAND",
+            "description": "Curated Gifts & Heritage Collection",
+            "prefill": {
+                "name": shipping_address["fullName"],
+                "email": request.user.email,
+                "contact": shipping_address["phone"],
+            },
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def razorpay_verify(request):
+    if not _razorpay_configured():
+        return Response({"error": "Online payments are not configured yet."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    serializer = RazorpayVerifySerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    razorpay_order_id = serializer.validated_data["razorpay_order_id"]
+    razorpay_payment_id = serializer.validated_data["razorpay_payment_id"]
+    razorpay_signature = serializer.validated_data["razorpay_signature"]
+    if not _verify_razorpay_signature(razorpay_order_id, razorpay_payment_id, razorpay_signature):
+        RazorpayCheckout.objects.filter(
+            razorpay_order_id=razorpay_order_id,
+            user=request.user,
+            order__isnull=True,
+        ).update(status=RazorpayCheckout.Status.FAILED, failure_reason="Invalid payment signature.")
+        return Response({"error": "Payment signature verification failed."}, status=status.HTTP_400_BAD_REQUEST)
+    with transaction.atomic():
+        checkout = get_object_or_404(
+            RazorpayCheckout.objects.select_for_update(),
+            razorpay_order_id=razorpay_order_id,
+            user=request.user,
+        )
+        order, created, error_response = _finalize_razorpay_checkout(checkout, razorpay_payment_id, razorpay_signature)
+        if error_response is not None:
+            return error_response
+    return Response(
+        {"order": OrderSerializer(order).data},
+        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def razorpay_fail(request):
+    serializer = RazorpayFailSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    checkout = get_object_or_404(
+        RazorpayCheckout,
+        razorpay_order_id=serializer.validated_data["razorpay_order_id"],
+        user=request.user,
+    )
+    if checkout.order_id or checkout.status == RazorpayCheckout.Status.PAID:
+        return Response({"status": checkout.status})
+    checkout.status = (
+        RazorpayCheckout.Status.CANCELLED
+        if serializer.validated_data.get("cancelled")
+        else RazorpayCheckout.Status.FAILED
+    )
+    reason = serializer.validated_data.get("reason", "").strip()
+    if reason:
+        checkout.failure_reason = reason[:300]
+    checkout.save(update_fields=["status", "failure_reason", "updated_at"])
+    return Response({"status": checkout.status})
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def razorpay_webhook(request):
+    if not settings.RAZORPAY_WEBHOOK_SECRET:
+        return Response({"error": "Razorpay webhook secret is not configured."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if not signature or not _verify_razorpay_webhook_signature(request.body, signature):
+        return Response({"error": "Invalid webhook signature."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        payload = json.loads(request.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return Response({"error": "Invalid JSON payload."}, status=status.HTTP_400_BAD_REQUEST)
+    event = payload.get("event", "")
+    payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {}) or {}
+    order_entity = payload.get("payload", {}).get("order", {}).get("entity", {}) or {}
+    razorpay_order_id = payment_entity.get("order_id") or order_entity.get("id") or ""
+    razorpay_payment_id = payment_entity.get("id") or ""
+    if event in ("payment.captured", "order.paid") and razorpay_order_id:
+        with transaction.atomic():
+            checkout = RazorpayCheckout.objects.select_for_update().filter(razorpay_order_id=razorpay_order_id).first()
+            if checkout:
+                _, _, error_response = _finalize_razorpay_checkout(checkout, razorpay_payment_id)
+                if error_response is not None:
+                    return error_response
+    elif event == "payment.failed" and razorpay_order_id:
+        RazorpayCheckout.objects.filter(
+            razorpay_order_id=razorpay_order_id,
+            order__isnull=True,
+            status=RazorpayCheckout.Status.CREATED,
+        ).update(
+            status=RazorpayCheckout.Status.FAILED,
+            razorpay_payment_id=razorpay_payment_id,
+            failure_reason=str(payment_entity.get("error_description") or "Payment failed")[:300],
+        )
+    return Response({"status": "ok"})
 
 
 @api_view(["POST"])
@@ -716,9 +1087,7 @@ def cancel_order(request, order_id):
             if item.product_id:
                 Product.objects.filter(pk=item.product_id).update(stock=F("stock") + item.quantity)
         order.status = Order.Status.CANCELLED
-        order.payment_status = Order.PaymentStatus.FAILED
-        order.save(update_fields=["status", "payment_status", "updated_at"])
-        Payment.objects.filter(order=order, status=Payment.Status.PENDING).update(status=Payment.Status.FAILED)
+        _mark_cancelled_payment(order)
     order.refresh_from_db()
     return Response({"order": OrderSerializer(order).data})
 
@@ -1030,13 +1399,9 @@ def admin_order_status(request, order_id):
             order.save(update_fields=["status", "payment_status", "updated_at"])
             Payment.objects.filter(order=order).update(status=Payment.Status.PAID)
         elif new_status == Order.Status.CANCELLED:
-            order.payment_status = Order.PaymentStatus.FAILED
-            order.save(update_fields=["status", "payment_status", "updated_at"])
-            Payment.objects.filter(order=order, status=Payment.Status.PENDING).update(status=Payment.Status.FAILED)
+            _mark_cancelled_payment(order)
         else:
             order.save(update_fields=["status", "updated_at"])
-            if new_status == Order.Status.CANCELLED:
-                Payment.objects.filter(order=order, status=Payment.Status.PENDING).update(status=Payment.Status.FAILED)
     return Response({"order": {"id": order.id, "status": order.status}})
 
 

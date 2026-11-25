@@ -1,11 +1,17 @@
+import hashlib
+import hmac
+import json
 from decimal import Decimal
 from unittest.mock import patch
 
+from django.conf import settings
+from django.core import mail
 from django.core.management import call_command
+from django.test import override_settings
 from rest_framework.test import APITestCase
 
 from .management.commands.seed_catalog import RETURN_GIFT_PRODUCTS
-from .models import Category, DeliveryChargeSettings, Order, Payment, Product, Quotation, User
+from .models import CartItem, Category, DeliveryChargeSettings, Order, Payment, Product, Quotation, RazorpayCheckout, User
 from .views import DeliveryLocationNotFound, _nominatim_geocode
 
 
@@ -405,3 +411,194 @@ class StoreApiTests(APITestCase):
             User.objects.get(email="new@example.com").profile.address["addressLine2"],
             "Town Centre",
         )
+
+    def test_domain_settings_support_production_frontend_and_backend_domains(self):
+        self.assertIn("api.vedhikareturngift.com", settings.ALLOWED_HOSTS)
+        self.assertIn("https://vedhikareturngift.com", settings.CORS_ALLOWED_ORIGINS)
+        self.assertIn("https://www.vedhikareturngift.com", settings.CORS_ALLOWED_ORIGINS)
+        self.assertIn("https://api.vedhikareturngift.com", settings.CSRF_TRUSTED_ORIGINS)
+        self.assertIn("https://vedhikareturngift.com", settings.CSRF_TRUSTED_ORIGINS)
+        self.assertEqual(settings.FRONTEND_URL, "https://vedhikareturngift.com")
+        self.assertEqual(settings.SECURE_PROXY_SSL_HEADER, ("HTTP_X_FORWARDED_PROTO", "https"))
+
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+    def test_forgot_password_email_uses_production_frontend_domain(self):
+        mail.outbox.clear()
+        response = self.client.post(
+            "/api/auth/forgot-password",
+            {"email": self.customer.email},
+            format="json",
+            HTTP_HOST="api.vedhikareturngift.com",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("https://vedhikareturngift.com/reset-password/", mail.outbox[0].body)
+
+    def test_products_endpoint_returns_cors_headers_and_https_media_urls_behind_proxy(self):
+        self.product.images.create(image="products/sample.jpg", is_primary=True)
+        response = self.client.get(
+            "/api/products",
+            HTTP_HOST="api.vedhikareturngift.com",
+            HTTP_ORIGIN="https://vedhikareturngift.com",
+            HTTP_X_FORWARDED_PROTO="https",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "https://vedhikareturngift.com")
+        self.assertEqual(
+            response.data["products"][0]["image_url"],
+            "https://api.vedhikareturngift.com/media/products/sample.jpg",
+        )
+
+    @override_settings(RAZORPAY_KEY_ID="rzp_test_123", RAZORPAY_KEY_SECRET="secret_test_123")
+    def test_payment_config_exposes_key_id_only_without_secret(self):
+        response = self.client.get("/api/payments/config")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["razorpay_enabled"])
+        self.assertEqual(response.data["razorpay_key_id"], "rzp_test_123")
+        self.assertNotIn("secret_test_123", str(response.data))
+
+    @override_settings(RAZORPAY_KEY_ID="rzp_test_123", RAZORPAY_KEY_SECRET="secret_test_123")
+    @patch("store.views._razorpay_create_remote_order", return_value={"id": "order_rzp_1001", "currency": "INR"})
+    def test_razorpay_checkout_verify_and_cancel_refund_flow(self, mock_create_remote_order):
+        self.client.force_authenticate(self.customer)
+        self.client.post("/api/cart/items", {"productId": self.product.id, "quantity": 2}, format="json")
+        address = {
+            "fullName": "A Boutique Customer",
+            "phone": "+91 9876543210",
+            "addressLine1": "12 Market Road",
+            "city": "Chennai",
+            "state": "Tamil Nadu",
+            "postalCode": "600001",
+            "country": "India",
+        }
+
+        create_response = self.client.post(
+            "/api/payments/razorpay/order",
+            {
+                "shippingAddress": address,
+                "customizations": [{"productId": self.product.id, "giftMessage": "Warm wishes", "printedName": "Vedha"}],
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, 201, create_response.data)
+        self.assertEqual(create_response.data["orderId"], "order_rzp_1001")
+        self.assertEqual(create_response.data["amount"], 700000)
+        mock_create_remote_order.assert_called_once()
+        # Stock and cart remain untouched until payment verification succeeds.
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock, 4)
+        self.assertEqual(CartItem.objects.filter(cart__user=self.customer).count(), 1)
+
+        bad_verify = self.client.post(
+            "/api/payments/razorpay/verify",
+            {
+                "razorpay_order_id": "order_rzp_1001",
+                "razorpay_payment_id": "pay_rzp_9001",
+                "razorpay_signature": "invalid_signature",
+            },
+            format="json",
+        )
+        self.assertEqual(bad_verify.status_code, 400)
+        self.assertEqual(Order.objects.count(), 0)
+
+        signature = hmac.new(
+            b"secret_test_123",
+            b"order_rzp_1001|pay_rzp_9001",
+            hashlib.sha256,
+        ).hexdigest()
+        verify_response = self.client.post(
+            "/api/payments/razorpay/verify",
+            {
+                "razorpay_order_id": "order_rzp_1001",
+                "razorpay_payment_id": "pay_rzp_9001",
+                "razorpay_signature": signature,
+            },
+            format="json",
+        )
+        self.assertEqual(verify_response.status_code, 201, verify_response.data)
+        order = Order.objects.get(pk=verify_response.data["order"]["id"])
+        self.assertEqual(order.payment_method, "razorpay")
+        self.assertEqual(order.payment_status, Order.PaymentStatus.PAID)
+        self.assertEqual(order.status, Order.Status.CONFIRMED)
+        self.assertEqual(Payment.objects.get(order=order).provider_reference, "pay_rzp_9001")
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock, 2)
+        self.assertEqual(CartItem.objects.filter(cart__user=self.customer).count(), 0)
+
+        # Verification replay is idempotent and does not deduct stock twice.
+        replay_response = self.client.post(
+            "/api/payments/razorpay/verify",
+            {
+                "razorpay_order_id": "order_rzp_1001",
+                "razorpay_payment_id": "pay_rzp_9001",
+                "razorpay_signature": signature,
+            },
+            format="json",
+        )
+        self.assertEqual(replay_response.status_code, 200)
+        self.assertEqual(Order.objects.count(), 1)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock, 2)
+
+        cancel_response = self.client.post(f"/api/orders/{order.id}/cancel")
+        self.assertEqual(cancel_response.status_code, 200)
+        self.assertEqual(cancel_response.data["order"]["payment_status"], Order.PaymentStatus.REFUNDED)
+        self.assertEqual(Payment.objects.get(order=order).status, Payment.Status.REFUNDED)
+
+    @override_settings(
+        RAZORPAY_KEY_ID="rzp_test_123",
+        RAZORPAY_KEY_SECRET="secret_test_123",
+        RAZORPAY_WEBHOOK_SECRET="whsec_test_123",
+    )
+    def test_razorpay_webhook_finalizes_captured_payment(self):
+        checkout = RazorpayCheckout.objects.create(
+            user=self.customer,
+            razorpay_order_id="order_rzp_wh_1",
+            subtotal=Decimal("3500.00"),
+            delivery_charge=Decimal("0.00"),
+            amount=Decimal("3500.00"),
+            shipping_address={
+                "fullName": "A Boutique Customer",
+                "phone": "+91 9876543210",
+                "addressLine1": "12 Market Road",
+                "city": "Chennai",
+                "state": "Tamil Nadu",
+                "postalCode": "600001",
+                "country": "India",
+            },
+            items_snapshot=[
+                {
+                    "product_id": self.product.id,
+                    "product_name": self.product.name,
+                    "unit_price": "3500.00",
+                    "quantity": 1,
+                    "gift_message": "",
+                    "printed_name": "",
+                }
+            ],
+        )
+        body = json.dumps(
+            {
+                "event": "payment.captured",
+                "payload": {"payment": {"entity": {"id": "pay_rzp_wh_1", "order_id": "order_rzp_wh_1"}}},
+            }
+        ).encode("utf-8")
+        webhook_sig = hmac.new(b"whsec_test_123", body, hashlib.sha256).hexdigest()
+
+        response = self.client.post(
+            "/api/payments/razorpay/webhook",
+            data=body,
+            content_type="application/json",
+            HTTP_X_RAZORPAY_SIGNATURE=webhook_sig,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        checkout.refresh_from_db()
+        self.assertEqual(checkout.status, RazorpayCheckout.Status.PAID)
+        self.assertIsNotNone(checkout.order)
+        self.assertEqual(checkout.order.payment_status, Order.PaymentStatus.PAID)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock, 3)

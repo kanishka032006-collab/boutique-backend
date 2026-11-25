@@ -165,6 +165,25 @@ class OrderCreateSerializer(serializers.Serializer):
     shippingAddress = ShippingAddressSerializer()
     notes = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
     customizations = OrderCustomizationSerializer(many=True, required=False, default=list)
+    paymentMethod = serializers.ChoiceField(choices=["cash_on_delivery"], required=False, default="cash_on_delivery")
+
+
+class RazorpayOrderCreateSerializer(serializers.Serializer):
+    shippingAddress = ShippingAddressSerializer()
+    notes = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
+    customizations = OrderCustomizationSerializer(many=True, required=False, default=list)
+
+
+class RazorpayVerifySerializer(serializers.Serializer):
+    razorpay_order_id = serializers.CharField(max_length=100)
+    razorpay_payment_id = serializers.CharField(max_length=100)
+    razorpay_signature = serializers.CharField(max_length=255)
+
+
+class RazorpayFailSerializer(serializers.Serializer):
+    razorpay_order_id = serializers.CharField(max_length=100)
+    reason = serializers.CharField(max_length=300, required=False, allow_blank=True, default="")
+    cancelled = serializers.BooleanField(required=False, default=False)
 
 
 class DeliveryChargeSettingsSerializer(serializers.ModelSerializer):
